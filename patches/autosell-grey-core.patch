@@ -1,0 +1,160 @@
+--- a/src/server/game/Entities/Player/Player.cpp
++++ b/src/server/game/Entities/Player/Player.cpp
+@@ -13770,10 +13770,158 @@
+     }
+
+     ItemPosCountVec dest;
+     msg = CanStoreNewItem(NULL_BAG, NULL_SLOT, dest, item->itemid, item->count);
+
++    // AUTOSELL_GREY_FULL_BAG_V2
++    //
++    // Important ordering rule:
++    // normal inventory validation ALWAYS runs first. Auto Sell may only
++    // bypass the specific "inventory full" result; every other storage
++    // restriction remains authoritative.
++    bool autoSold = false;
++
++    if ((msg == EQUIP_ERR_OK || msg == EQUIP_ERR_INVENTORY_FULL) && GetLevel() >= 6)
++    {
++        ItemTemplate const* itemTemplate = sObjectMgr->GetItemTemplate(item->itemid);
++
++        bool const safeGrey =
++            itemTemplate &&
++            itemTemplate->Quality == ITEM_QUALITY_POOR &&
++            itemTemplate->SellPrice > 0 &&
++            itemTemplate->StartQuest == 0 &&
++            itemTemplate->Class != ITEM_CLASS_QUEST &&
++            itemTemplate->Class != ITEM_CLASS_KEY &&
++            !itemTemplate->HasFlag(ITEM_FLAG_HAS_LOOT) &&
++            !itemTemplate->HasFlag(ITEM_FLAG_NO_USER_DESTROY) &&
++            !qitem &&
++            !conditem &&
++            !HasQuestForItem(item->itemid);
++
++        if (safeGrey)
++        {
++            // Real players get a row from the Lua login/level/command logic.
++            // Bots are deliberately not given one, so "no row" means OFF here.
++            bool autoSellEnabled = false;
++
++            if (QueryResult settingResult = CharacterDatabase.Query(
++                    "SELECT enabled "
++                    "FROM character_autosell_settings "
++                    "WHERE guid = {} "
++                    "LIMIT 1",
++                    GetGUID().GetCounter()))
++            {
++                Field* settingFields = settingResult->Fetch();
++                autoSellEnabled = settingFields[0].Get<uint8>() != 0;
++            }
++
++            if (autoSellEnabled)
++            {
++                uint64 const totalPrice64 =
++                    static_cast<uint64>(itemTemplate->SellPrice) *
++                    static_cast<uint64>(item->count);
++
++                // ModifyMoney takes int32. If the full value cannot be credited,
++                // do not consume the loot item; fall through to normal handling.
++                if (totalPrice64 > 0 && totalPrice64 <= static_cast<uint64>(MAX_MONEY_AMOUNT))
++                {
++                    uint32 const totalPrice = static_cast<uint32>(totalPrice64);
++
++                    if (ModifyMoney(static_cast<int64>(totalPrice)))
++                    {
++                        if (qitem)
++                        {
++                            qitem->is_looted = true;
++
++                            if (item->freeforall || loot->GetPlayerQuestItems().size() == 1)
++                                SendNotifyLootItemRemoved(lootSlot);
++                            else
++                                loot->NotifyQuestItemRemoved(qitem->index);
++                        }
++                        else
++                        {
++                            if (ffaitem)
++                            {
++                                ffaitem->is_looted = true;
++                                SendNotifyLootItemRemoved(lootSlot);
++                            }
++                            else
++                            {
++                                if (conditem)
++                                    conditem->is_looted = true;
++
++                                loot->NotifyItemRemoved(lootSlot);
++                            }
++                        }
++
++                        if (!item->freeforall)
++                            item->is_looted = true;
++
++                        --loot->unlootedCount;
++
++                        if (loot->containerGUID)
++                            sLootItemStorage->RemoveStoredLootItem(
++                                loot->containerGUID,
++                                item->itemid,
++                                item->count,
++                                loot,
++                                item->itemIndex);
++
++                        uint32 const gold = totalPrice / 10000;
++                        uint32 const silver = (totalPrice % 10000) / 100;
++                        uint32 const copper = totalPrice % 100;
++
++                        std::string moneyText;
++
++                        if (gold > 0)
++                            moneyText += std::to_string(gold) + "g";
++
++                        if (silver > 0)
++                        {
++                            if (!moneyText.empty())
++                                moneyText += " ";
++
++                            moneyText += std::to_string(silver) + "s";
++                        }
++
++                        if (copper > 0 || moneyText.empty())
++                        {
++                            if (!moneyText.empty())
++                                moneyText += " ";
++
++                            moneyText += std::to_string(copper) + "c";
++                        }
++
++                        std::string const itemLink =
++                            "|cff9d9d9d|Hitem:" +
++                            std::to_string(item->itemid) +
++                            ":0:0:0:0:0:0:0:0:0|h[" +
++                            itemTemplate->Name1 +
++                            "]|h|r";
++
++                        std::string const countText =
++                            item->count > 1
++                                ? " x" + std::to_string(uint32(item->count))
++                                : "";
++
++                        ChatHandler(GetSession()).PSendSysMessage(
++                            "Sold {}{} for {}.",
++                            itemLink,
++                            countText,
++                            moneyText);
++
++                        msg = EQUIP_ERR_OK;
++                        autoSold = true;
++                    }
++                }
++            }
++        }
++    }
++
++    if (autoSold)
++        return item;
++
+     if (msg == EQUIP_ERR_OK)
+     {
+         AllowedLooterSet looters = item->GetAllowedLooters();
+         Item* newitem = StoreNewItem(dest, item->itemid, true, item->randomPropertyId, looters);
